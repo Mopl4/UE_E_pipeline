@@ -49,6 +49,13 @@ def load_y_csv(*, y_csv: str | Path) -> np.ndarray:
     return y_df.iloc[:, 1].to_numpy(dtype=np.int64)
 
 
+def h5_num_rows(*, x_h5: str | Path, dataset_key: str) -> int:
+    import h5py
+
+    with h5py.File(x_h5, "r") as f:
+        return int(f[dataset_key].shape[0])
+
+
 def validate_h5_matches_y(*, x_h5: str | Path, dataset_key: str, y: np.ndarray) -> None:
     import h5py
 

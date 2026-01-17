@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from pipeline import artifacts
-from pipeline.data import load_tabular_csv, load_y_csv, validate_h5_matches_y
+from pipeline.data import h5_num_rows, load_y_csv, validate_h5_matches_y
 from pipeline.metrics import compute_basic_metrics
 from pipeline.models.hgb import HGBConfig, HGBTabularModel
 from pipeline.models.cnn import CNNConfig, CNNTemporalModel
@@ -18,6 +18,7 @@ from pipeline.models.lstm import LSTMConfig, LSTMTemporalModel
 from pipeline.models.meta import MetaConfig, MetaLogReg
 from pipeline.stacking_oof import run_oof
 from pipeline.feature_engineering.dwt_combo import DWTComboConfig, featurize_h5_for_hgb
+from pipeline.feature_engineering.h5_basic import load_h5_meta_features
 from pipeline.optimize import OptConfig, sample_params, split_namespaced
 
 
@@ -34,11 +35,9 @@ def _parse_args() -> argparse.Namespace:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     train = sub.add_parser("train", help="Train OOF stacking and save a run.")
-    train.add_argument("--x-csv", default="data/X_train_merged.csv")
     train.add_argument("--y-csv", default="data/y_train_2.csv")
     train.add_argument("--x-h5", default="data/X_train.h5")
     train.add_argument("--h5-dataset-key", default="features")
-    train.add_argument("--drop-cols", nargs="*", default=["Unnamed: 0", "label", "id"])
     train.add_argument("--splits", type=int, default=3)
     train.add_argument(
         "--with-hgb",
@@ -66,6 +65,11 @@ def _parse_args() -> argparse.Namespace:
     train.add_argument("--timing", action="store_true")
     train.add_argument("--hgb-fe", action="store_true", help="Compute HGB features from H5 using both DWT methods.")
     train.add_argument("--hgb-fe-chunk-size", type=int, default=4096)
+    train.add_argument(
+        "--hgb-meta-only",
+        action="store_true",
+        help="Si --hgb-fe n'est pas activé, entraîne HGB uniquement sur les 11 meta features (drop du signal brut).",
+    )
 
     # Class imbalance handling (train-time only)
     train.add_argument(
@@ -119,19 +123,15 @@ def _parse_args() -> argparse.Namespace:
 
     pred = sub.add_parser("predict", help="Predict using a saved run (no training).")
     pred.add_argument("--run-dir", required=True)
-    pred.add_argument("--x-csv", default=None, help="CSV tabulaire (si le run attend du CSV).")
     pred.add_argument("--x-h5", default=None, help="H5 (si le run attend du H5).")
     pred.add_argument("--h5-dataset-key", default="features")
-    pred.add_argument("--drop-cols", nargs="*", default=["Unnamed: 0", "label", "id"])
     pred.add_argument("--out", required=True)
 
     ev = sub.add_parser("evaluate", help="Evaluate a saved run without modifying it.")
     ev.add_argument("--run-dir", required=True)
-    ev.add_argument("--x-csv", default=None)
     ev.add_argument("--y-csv", default=None)
     ev.add_argument("--x-h5", default=None)
     ev.add_argument("--h5-dataset-key", default="features")
-    ev.add_argument("--drop-cols", nargs="*", default=["Unnamed: 0", "label", "id"])
 
     an = sub.add_parser("analyze", help="Analyze saved predictions (OOF by default) from a run.")
     an.add_argument("--run-dir", required=True)
@@ -238,8 +238,13 @@ def _train(args: argparse.Namespace) -> None:
     artifacts.ensure_dir(run_dir)
 
     y_full = load_y_csv(y_csv=args.y_csv)
+    validate_h5_matches_y(x_h5=args.x_h5, dataset_key=args.h5_dataset_key, y=y_full)
     if args.hgb_fe and not args.with_hgb:
         raise ValueError("--hgb-fe requires HGB enabled (remove --no-with-hgb or disable --hgb-fe).")
+    if args.with_hgb and not args.hgb_fe and not args.hgb_meta_only:
+        raise ValueError(
+            "HGB requires either --hgb-fe (feature engineering) or --hgb-meta-only (drop signal, keep 11 meta)."
+        )
     if args.undersample_balanced and args.class_weights_auto:
         raise ValueError("Choose only one imbalance option: --undersample-balanced OR --class-weights-auto.")
 
@@ -300,7 +305,6 @@ def _train(args: argparse.Namespace) -> None:
 
     X_tab: np.ndarray | None = None
     if args.with_hgb and args.hgb_fe:
-        validate_h5_matches_y(x_h5=args.x_h5, dataset_key=args.h5_dataset_key, y=y_full)
         cache_path = run_dir / "cache/hgb_features.npy"
         X_tab = featurize_h5_for_hgb(
             h5_path=args.x_h5,
@@ -310,16 +314,14 @@ def _train(args: argparse.Namespace) -> None:
             indices=kept_idx,
             out_npy=cache_path,
         )
-    elif args.with_hgb:
-        Xds = load_tabular_csv(x_csv=args.x_csv, y_csv=None, drop_cols=args.drop_cols)
-        X_tab = Xds.X
-        if kept_idx is not None:
-            raise ValueError(
-                "Undersampling requires all models to start from H5. "
-                "Enable --hgb-fe (and provide --x-h5) instead of CSV input."
-            )
-        if X_tab.shape[0] != y_full.shape[0]:
-            raise ValueError(f"CSV/X and y length mismatch: X={X_tab.shape[0]} y={y.shape[0]}")
+    elif args.with_hgb and args.hgb_meta_only:
+        cache_path = run_dir / "cache/hgb_meta.npy"
+        X_tab = load_h5_meta_features(
+            h5_path=args.x_h5,
+            dataset_key=args.h5_dataset_key,
+            indices=kept_idx,
+            out_npy=cache_path,
+        )
 
     if args.with_hgb:
         if X_tab is None:
@@ -327,7 +329,6 @@ def _train(args: argparse.Namespace) -> None:
         base_models.append(HGBTabularModel(X_tabular=X_tab, config=HGBConfig(), sample_weight=sample_weight))
 
     if args.with_lstm:
-        validate_h5_matches_y(x_h5=args.x_h5, dataset_key=args.h5_dataset_key, y=y_full)
         base_models.append(
             LSTMTemporalModel(
                 x_h5_path=args.x_h5,
@@ -338,7 +339,6 @@ def _train(args: argparse.Namespace) -> None:
             )
         )
     if args.with_cnn:
-        validate_h5_matches_y(x_h5=args.x_h5, dataset_key=args.h5_dataset_key, y=y_full)
         if args.cnn_load_only:
             print(f"[WARN] CNN load-only may leak if it was trained on this same dataset: {args.cnn_load_model}")
         max_train = None if int(args.cnn_max_train_samples) == 0 else int(args.cnn_max_train_samples)
@@ -530,9 +530,8 @@ def _train(args: argparse.Namespace) -> None:
             base_model_kinds=oof.base_model_kinds,
             paths=paths,
             config_used={
-                "x_csv": str(args.x_csv),
                 "y_csv": str(args.y_csv),
-                "x_h5": str(args.x_h5) if args.with_lstm else None,
+                "x_h5": str(args.x_h5),
                 "h5_dataset_key": str(args.h5_dataset_key),
                 "splits": int(args.splits),
                 "with_lstm": bool(args.with_lstm),
@@ -545,7 +544,7 @@ def _train(args: argparse.Namespace) -> None:
                     "kept_idx_path": "balance/undersample_balanced.npz" if args.undersample_balanced else None,
                 },
                 "hgb": asdict(HGBConfig()),
-                "hgb_feature_engineering": "dwt_combo_h5" if args.hgb_fe else "csv",
+                "hgb_feature_engineering": "dwt_combo_h5" if args.hgb_fe else "meta_only_h5",
                 "hgb_fe_chunk_size": int(args.hgb_fe_chunk_size),
                 "lstm": asdict(_build_lstm_config(args)) if args.with_lstm else None,
                 "cnn": {
@@ -576,33 +575,18 @@ def _predict(args: argparse.Namespace) -> None:
     manifest = artifacts.load_manifest(run_dir)
     base_order = manifest.base_model_order
 
-    needs_h5 = any(name in ("lstm_temporal", "cnn_temporal") for name in base_order) or (
-        "hgb_tabular" in base_order and manifest.config_used.get("hgb_feature_engineering") == "dwt_combo_h5"
-    )
-    needs_csv = "hgb_tabular" in base_order and manifest.config_used.get("hgb_feature_engineering") != "dwt_combo_h5"
+    if args.x_h5 is None:
+        raise ValueError("predict now requires --x-h5 (pipeline is H5-only).")
 
-    if needs_h5 and args.x_h5 is None:
-        raise ValueError("This run requires --x-h5 (LSTM/CNN and/or HGB feature engineering from H5).")
-    if needs_csv and args.x_csv is None:
-        raise ValueError("This run requires --x-csv for HGB tabular features.")
-
-    # Determine N / ids from the primary input source (no silent reordering).
-    if needs_h5:
-        import h5py
-
-        with h5py.File(args.x_h5, "r") as f:  # type: ignore[arg-type]
-            ds = f[args.h5_dataset_key]
-            n = int(ds.shape[0])
-    else:
-        Xds_for_n = load_tabular_csv(x_csv=args.x_csv, y_csv=None, drop_cols=args.drop_cols)  # type: ignore[arg-type]
-        n = int(Xds_for_n.X.shape[0])
+    n = h5_num_rows(x_h5=args.x_h5, dataset_key=args.h5_dataset_key)
 
     idx = np.arange(n, dtype=np.int64)
 
     # Build HGB input if needed.
     X_tab: np.ndarray | None = None
     if "hgb_tabular" in base_order:
-        if manifest.config_used.get("hgb_feature_engineering") == "dwt_combo_h5":
+        fe = manifest.config_used.get("hgb_feature_engineering")
+        if fe == "dwt_combo_h5":
             X_tab = featurize_h5_for_hgb(
                 h5_path=args.x_h5,  # type: ignore[arg-type]
                 dataset_key=args.h5_dataset_key,
@@ -610,11 +594,10 @@ def _predict(args: argparse.Namespace) -> None:
                 cfg=DWTComboConfig(),
                 out_npy=None,
             )
+        elif fe == "meta_only_h5":
+            X_tab = load_h5_meta_features(h5_path=args.x_h5, dataset_key=args.h5_dataset_key, indices=None)
         else:
-            Xds = load_tabular_csv(x_csv=args.x_csv, y_csv=None, drop_cols=args.drop_cols)  # type: ignore[arg-type]
-            X_tab = Xds.X
-        if int(X_tab.shape[0]) != n:
-            raise ValueError(f"Input length mismatch between sources: n={n} vs X_tab={X_tab.shape[0]}")
+            raise ValueError(f"Unknown HGB feature mode in manifest: {fe}")
 
     # Load base models (final/refit required for inference)
     base_blocks: list[np.ndarray] = []
@@ -723,7 +706,7 @@ def _evaluate(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir)
     manifest = artifacts.load_manifest(run_dir)
 
-    if args.x_csv is None and args.y_csv is None:
+    if args.y_csv is None and args.x_h5 is None:
         # default: use OOF saved outputs
         oof = artifacts.load_npz(run_dir / "oof/oof_predictions.npz")
         y_true = oof["y_true"]
@@ -733,18 +716,16 @@ def _evaluate(args: argparse.Namespace) -> None:
         print(np.array(metrics["confusion_matrix"]))
         return
 
-    if args.x_csv is None or args.y_csv is None:
-        raise ValueError("evaluate requires both --x-csv and --y-csv, or neither (to use saved OOF).")
+    if args.x_h5 is None or args.y_csv is None:
+        raise ValueError("evaluate requires both --x-h5 and --y-csv, or neither (to use saved OOF).")
 
     # evaluate on a provided dataset using saved final models (no training)
     tmp_out = Path(run_dir) / f"_tmp_eval_{uuid.uuid4().hex}.csv"
     _predict(
         argparse.Namespace(
             run_dir=str(run_dir),
-            x_csv=args.x_csv,
             x_h5=args.x_h5,
             h5_dataset_key=args.h5_dataset_key,
-            drop_cols=args.drop_cols,
             out=str(tmp_out),
         )
     )
