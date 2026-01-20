@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from pipeline.data import h5_num_rows, load_y_csv, validate_h5_matches_y
 from pipeline.metrics import compute_basic_metrics
 from pipeline.models.hgb import HGBConfig, HGBTabularModel
 from pipeline.models.cnn import CNNConfig, CNNTemporalModel
+from pipeline.models.chloe import ChloeConfig, ChloeModel
 from pipeline.models.lstm import LSTMConfig, LSTMTemporalModel
 from pipeline.models.meta import MetaConfig, MetaLogReg
 from pipeline.stacking_oof import run_oof
@@ -34,7 +36,14 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="pipeline", description="Reproducible stacking pipeline.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    train = sub.add_parser("train", help="Train OOF stacking and save a run.")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Force CPU-only for TensorFlow (set env before any TF import) to avoid CUDA init attempts.",
+    )
+
+    train = sub.add_parser("train", help="Train OOF stacking and save a run.", parents=[common])
     train.add_argument("--y-csv", default="data/y_train_2.csv")
     train.add_argument("--x-h5", default="data/X_train.h5")
     train.add_argument("--h5-dataset-key", default="features")
@@ -57,6 +66,12 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Activer/désactiver le base model CNN (par défaut: désactivé).",
     )
+    train.add_argument(
+        "--with-chloe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Activer/désactiver le base model Chloe (multi-entrée CNN+LSTM + MLP).",
+    )
 
     train.add_argument("--meta-C", type=float, default=1.0)
     train.add_argument("--refit-final", action=argparse.BooleanOptionalAction, default=True)
@@ -68,7 +83,7 @@ def _parse_args() -> argparse.Namespace:
     train.add_argument(
         "--hgb-meta-only",
         action="store_true",
-        help="Si --hgb-fe n'est pas activé, entraîne HGB uniquement sur les 11 meta features (drop du signal brut).",
+        help="HGB meta-only (11 meta features, drop signal). Par défaut si HGB est activé sans --hgb-fe.",
     )
 
     # Class imbalance handling (train-time only)
@@ -94,6 +109,12 @@ def _parse_args() -> argparse.Namespace:
     train.add_argument("--lstm-batch-size", type=int, default=32)
     train.add_argument("--lstm-predict-batch-size", type=int, default=1024)
     train.add_argument("--lstm-verbose", type=int, default=1)
+    train.add_argument(
+        "--lstm-tf-log-level",
+        type=int,
+        default=2,
+        help="TF_CPP_MIN_LOG_LEVEL (appliqué aux modèles TF: LSTM/CNN/Chloe). 0=all,1=info,2=warning,3=error.",
+    )
     train.add_argument("--lstm-load-model", default=None)
 
     # CNN params
@@ -106,6 +127,33 @@ def _parse_args() -> argparse.Namespace:
     train.add_argument("--cnn-predict-batch-size", type=int, default=4096)
     train.add_argument("--cnn-verbose", type=int, default=1)
 
+    # Chloe model params (defaults match lstm-cnn.py)
+    train.add_argument("--chloe-epochs", type=int, default=10)
+    train.add_argument("--chloe-batch-size", type=int, default=32)
+    train.add_argument("--chloe-predict-batch-size", type=int, default=2048)
+    train.add_argument("--chloe-verbose", type=int, default=1)
+    train.add_argument("--chloe-lr", type=float, default=0.0, help="0 => Adam default")
+    train.add_argument("--chloe-conv1-filters", type=int, default=32)
+    train.add_argument("--chloe-conv1-kernel", type=int, default=10)
+    train.add_argument("--chloe-conv1-stride", type=int, default=2)
+    train.add_argument("--chloe-pool-size", type=int, default=2)
+    train.add_argument("--chloe-conv2-filters", type=int, default=64)
+    train.add_argument("--chloe-conv2-kernel", type=int, default=5)
+    train.add_argument("--chloe-conv2-stride", type=int, default=2)
+    train.add_argument("--chloe-eeg-lstm-units", type=int, default=64)
+    train.add_argument("--chloe-meta-dense-units", type=int, default=32)
+    train.add_argument("--chloe-fusion-dense-units", type=int, default=32)
+    train.add_argument(
+        "--chloe-load-only",
+        action="store_true",
+        help="Charge un modèle Chloe sauvegardé (dir avec model.keras + scalers) et ne ré-entraîne pas (attention leakage).",
+    )
+    train.add_argument(
+        "--chloe-load-dir",
+        default=None,
+        help="Répertoire contenant les artefacts Chloe (model.keras + scaler_meta.joblib + scaler_eeg.joblib).",
+    )
+
     # Optimize (random search, no extra deps)
     train.add_argument("--optimize", action="store_true", help="Active une random search (sans dépendances).")
     train.add_argument("--opt-trials", type=int, default=20)
@@ -114,14 +162,16 @@ def _parse_args() -> argparse.Namespace:
         "--opt-targets",
         nargs="+",
         default=["meta"],
-        help="Quels modèles optimiser: meta hgb lstm cnn (ex: --opt-targets meta hgb).",
+        help="Quels modèles optimiser: meta hgb lstm cnn chloe (ex: --opt-targets meta hgb).",
     )
     train.add_argument("--opt-budget-lstm-epochs", type=int, default=1)
     train.add_argument("--opt-budget-lstm-max-train-samples", type=int, default=20000)
     train.add_argument("--opt-budget-cnn-epochs", type=int, default=2)
     train.add_argument("--opt-budget-cnn-max-train-samples", type=int, default=20000)
+    train.add_argument("--opt-budget-chloe-epochs", type=int, default=2)
+    train.add_argument("--opt-budget-chloe-max-train-samples", type=int, default=20000)
 
-    pred = sub.add_parser("predict", help="Predict using a saved run (no training).")
+    pred = sub.add_parser("predict", help="Predict using a saved run (no training).", parents=[common])
     pred.add_argument("--run-dir", required=True)
     pred.add_argument("--x-h5", default=None, help="H5 (si le run attend du H5).")
     pred.add_argument("--h5-dataset-key", default="features")
@@ -133,13 +183,13 @@ def _parse_args() -> argparse.Namespace:
         help="Format de sortie: full (id,pred,proba_*) ou benchmark (id,label).",
     )
 
-    ev = sub.add_parser("evaluate", help="Evaluate a saved run without modifying it.")
+    ev = sub.add_parser("evaluate", help="Evaluate a saved run without modifying it.", parents=[common])
     ev.add_argument("--run-dir", required=True)
     ev.add_argument("--y-csv", default=None)
     ev.add_argument("--x-h5", default=None)
     ev.add_argument("--h5-dataset-key", default="features")
 
-    an = sub.add_parser("analyze", help="Analyze saved predictions (OOF by default) from a run.")
+    an = sub.add_parser("analyze", help="Analyze saved predictions (OOF by default) from a run.", parents=[common])
     an.add_argument("--run-dir", required=True)
     an.add_argument(
         "--source",
@@ -163,6 +213,15 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _apply_cpu_only() -> None:
+    """
+    Best-effort to prevent TensorFlow from attempting CUDA init on machines without GPU.
+    Must run before the first TensorFlow import in the current process.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_enable_xla_devices=false")
+
+
 def _resolve_run_dir(arg: str | None) -> Path:
     if arg is None:
         return _default_run_dir()
@@ -180,6 +239,7 @@ def _build_lstm_config(args: argparse.Namespace) -> LSTMConfig:
             max_train_samples=5000,
             predict_batch_size=4096,
             verbose=args.lstm_verbose,
+            tf_cpp_min_log_level=int(args.lstm_tf_log_level),
             load_model_path=args.lstm_load_model,
         )
     max_train = None if int(args.lstm_max_train_samples) == 0 else int(args.lstm_max_train_samples)
@@ -192,6 +252,7 @@ def _build_lstm_config(args: argparse.Namespace) -> LSTMConfig:
         max_train_samples=max_train,
         predict_batch_size=int(args.lstm_predict_batch_size),
         verbose=int(args.lstm_verbose),
+        tf_cpp_min_log_level=int(args.lstm_tf_log_level),
         load_model_path=args.lstm_load_model,
     )
 
@@ -229,6 +290,56 @@ def _build_cnn_config_for_opt(args: argparse.Namespace, overrides: dict[str, Any
     )
 
 
+def _build_chloe_config(args: argparse.Namespace) -> ChloeConfig:
+    lr = None if float(args.chloe_lr) == 0.0 else float(args.chloe_lr)
+    return ChloeConfig(
+        conv1_filters=int(args.chloe_conv1_filters),
+        conv1_kernel=int(args.chloe_conv1_kernel),
+        conv1_stride=int(args.chloe_conv1_stride),
+        pool_size=int(args.chloe_pool_size),
+        conv2_filters=int(args.chloe_conv2_filters),
+        conv2_kernel=int(args.chloe_conv2_kernel),
+        conv2_stride=int(args.chloe_conv2_stride),
+        eeg_lstm_units=int(args.chloe_eeg_lstm_units),
+        meta_dense_units=int(args.chloe_meta_dense_units),
+        fusion_dense_units=int(args.chloe_fusion_dense_units),
+        lr=lr,
+        epochs=int(args.chloe_epochs),
+        batch_size=int(args.chloe_batch_size),
+        predict_batch_size=int(args.chloe_predict_batch_size),
+        verbose=int(args.chloe_verbose),
+        tf_cpp_min_log_level=int(args.lstm_tf_log_level),
+        load_dir=args.chloe_load_dir if args.chloe_load_only else None,
+        max_train_samples=None,
+    )
+
+
+def _build_chloe_config_for_opt(args: argparse.Namespace, overrides: dict[str, Any], opt: OptConfig) -> ChloeConfig:
+    lr = overrides.get("lr", None)
+    lr = None if lr is None else float(lr)
+    max_train = None if int(opt.budget_chloe_max_train_samples) == 0 else int(opt.budget_chloe_max_train_samples)
+    return ChloeConfig(
+        conv1_filters=int(overrides.get("conv1_filters", int(args.chloe_conv1_filters))),
+        conv1_kernel=int(args.chloe_conv1_kernel),
+        conv1_stride=int(args.chloe_conv1_stride),
+        pool_size=int(args.chloe_pool_size),
+        conv2_filters=int(overrides.get("conv2_filters", int(args.chloe_conv2_filters))),
+        conv2_kernel=int(args.chloe_conv2_kernel),
+        conv2_stride=int(args.chloe_conv2_stride),
+        eeg_lstm_units=int(overrides.get("eeg_lstm_units", int(args.chloe_eeg_lstm_units))),
+        meta_dense_units=int(overrides.get("meta_dense_units", int(args.chloe_meta_dense_units))),
+        fusion_dense_units=int(overrides.get("fusion_dense_units", int(args.chloe_fusion_dense_units))),
+        lr=lr,
+        epochs=int(opt.budget_chloe_epochs),
+        batch_size=int(overrides.get("batch_size", int(args.chloe_batch_size))),
+        predict_batch_size=int(overrides.get("predict_batch_size", int(args.chloe_predict_batch_size))),
+        verbose=0,
+        tf_cpp_min_log_level=int(args.lstm_tf_log_level),
+        load_dir=None,
+        max_train_samples=max_train,
+    )
+
+
 def _build_hgb_config_for_opt(overrides: dict[str, Any]) -> HGBConfig:
     return HGBConfig(
         max_depth=overrides.get("max_depth", 8),
@@ -247,10 +358,6 @@ def _train(args: argparse.Namespace) -> None:
     validate_h5_matches_y(x_h5=args.x_h5, dataset_key=args.h5_dataset_key, y=y_full)
     if args.hgb_fe and not args.with_hgb:
         raise ValueError("--hgb-fe requires HGB enabled (remove --no-with-hgb or disable --hgb-fe).")
-    if args.with_hgb and not args.hgb_fe and not args.hgb_meta_only:
-        raise ValueError(
-            "HGB requires either --hgb-fe (feature engineering) or --hgb-meta-only (drop signal, keep 11 meta)."
-        )
     if args.undersample_balanced and args.class_weights_auto:
         raise ValueError("Choose only one imbalance option: --undersample-balanced OR --class-weights-auto.")
 
@@ -320,7 +427,7 @@ def _train(args: argparse.Namespace) -> None:
             indices=kept_idx,
             out_npy=cache_path,
         )
-    elif args.with_hgb and args.hgb_meta_only:
+    elif args.with_hgb:
         cache_path = run_dir / "cache/hgb_meta.npy"
         X_tab = load_h5_meta_features(
             h5_path=args.x_h5,
@@ -366,6 +473,21 @@ def _train(args: argparse.Namespace) -> None:
             )
         )
 
+    if args.with_chloe:
+        if args.chloe_load_only:
+            if args.chloe_load_dir is None:
+                raise ValueError("--chloe-load-only requires --chloe-load-dir")
+            print(f"[WARN] Chloe load-only may leak if trained on this dataset: {args.chloe_load_dir}")
+        base_models.append(
+            ChloeModel(
+                x_h5_path=args.x_h5,
+                dataset_key=args.h5_dataset_key,
+                config=_build_chloe_config(args),
+                index_map=kept_idx,
+                class_weight=class_weight,
+            )
+        )
+
     if not base_models:
         raise ValueError("No base models selected. Enable at least one of: --with-hgb, --with-lstm, --with-cnn.")
 
@@ -374,7 +496,7 @@ def _train(args: argparse.Namespace) -> None:
 
     if args.optimize:
         targets = tuple(str(t) for t in args.opt_targets)
-        allowed = {"meta", "hgb", "lstm", "cnn"}
+        allowed = {"meta", "hgb", "lstm", "cnn", "chloe"}
         if any(t not in allowed for t in targets):
             raise ValueError(f"--opt-targets must be subset of {sorted(allowed)}, got {targets}")
         if "hgb" in targets and not args.with_hgb:
@@ -383,10 +505,14 @@ def _train(args: argparse.Namespace) -> None:
             raise ValueError("Cannot optimize LSTM without --with-lstm.")
         if "cnn" in targets and not args.with_cnn:
             raise ValueError("Cannot optimize CNN without --with-cnn.")
+        if "chloe" in targets and not args.with_chloe:
+            raise ValueError("Cannot optimize Chloe without --with-chloe.")
         if args.cnn_load_only and "cnn" in targets:
             raise ValueError("Optimizing CNN while --cnn-load-only is enabled does not make sense (no training).")
         if args.lstm_load_model is not None and "lstm" in targets:
             raise ValueError("Optimizing LSTM while --lstm-load-model is set does not make sense (no training).")
+        if args.chloe_load_only and "chloe" in targets:
+            raise ValueError("Optimizing Chloe while --chloe-load-only is enabled does not make sense (no training).")
 
         opt_cfg = OptConfig(
             trials=int(args.opt_trials),
@@ -396,6 +522,8 @@ def _train(args: argparse.Namespace) -> None:
             budget_lstm_max_train_samples=int(args.opt_budget_lstm_max_train_samples),
             budget_cnn_epochs=int(args.opt_budget_cnn_epochs),
             budget_cnn_max_train_samples=int(args.opt_budget_cnn_max_train_samples),
+            budget_chloe_epochs=int(args.opt_budget_chloe_epochs),
+            budget_chloe_max_train_samples=int(args.opt_budget_chloe_max_train_samples),
         )
         artifacts.write_json(run_dir / "opt/config_used.json", opt_cfg.__dict__)
 
@@ -427,6 +555,12 @@ def _train(args: argparse.Namespace) -> None:
                     CNNTemporalModel(x_h5_path=args.x_h5, dataset_key=args.h5_dataset_key, config=cnn_cfg)
                 )
 
+            if args.with_chloe:
+                chloe_cfg = _build_chloe_config_for_opt(args, ns.get("chloe", {}), opt_cfg)
+                trial_models.append(
+                    ChloeModel(x_h5_path=args.x_h5, dataset_key=args.h5_dataset_key, config=chloe_cfg)
+                )
+
             oof_trial = run_oof(base_models=trial_models, y=y, n_splits=args.splits, timing=False)
 
             meta_C = float(ns.get("meta", {}).get("C", args.meta_C))
@@ -446,6 +580,8 @@ def _train(args: argparse.Namespace) -> None:
                         "lstm_max_train_samples": opt_cfg.budget_lstm_max_train_samples,
                         "cnn_epochs": opt_cfg.budget_cnn_epochs,
                         "cnn_max_train_samples": opt_cfg.budget_cnn_max_train_samples,
+                        "chloe_epochs": opt_cfg.budget_chloe_epochs,
+                        "chloe_max_train_samples": opt_cfg.budget_chloe_max_train_samples,
                     },
                     "oof_accuracy": score,
                 },
@@ -525,6 +661,9 @@ def _train(args: argparse.Namespace) -> None:
                 elif bm.name == "cnn_temporal":
                     paths["base_cnn_temporal"] = "models/base_cnn_temporal.keras"
                     bm.save(run_dir / paths["base_cnn_temporal"])  # type: ignore[attr-defined]
+                elif bm.name == "chloe_model":
+                    paths["base_chloe_model"] = "models/base_chloe_model"
+                    bm.save(run_dir / paths["base_chloe_model"])  # type: ignore[attr-defined]
                 else:
                     raise ValueError(f"Unknown base model for saving: {bm.name}")
 
@@ -543,6 +682,7 @@ def _train(args: argparse.Namespace) -> None:
                 "with_lstm": bool(args.with_lstm),
                 "with_hgb": bool(args.with_hgb),
                 "with_cnn": bool(args.with_cnn),
+                "with_chloe": bool(args.with_chloe),
                 "imbalance": {
                     "undersample_balanced": bool(args.undersample_balanced),
                     "undersample_seed": int(args.undersample_seed),
@@ -566,6 +706,7 @@ def _train(args: argparse.Namespace) -> None:
                 }
                 if args.with_cnn
                 else None,
+                "chloe": asdict(_build_chloe_config(args)) if args.with_chloe else None,
                 "meta": asdict(meta_cfg),
                 "refit_final": bool(args.refit_final),
             },
@@ -583,6 +724,10 @@ def _predict(args: argparse.Namespace) -> None:
 
     if args.x_h5 is None:
         raise ValueError("predict now requires --x-h5 (pipeline is H5-only).")
+
+    # Avoid TensorFlow attempting CUDA init on machines without GPU.
+    # Does not override user-provided CUDA_VISIBLE_DEVICES.
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
     n = h5_num_rows(x_h5=args.x_h5, dataset_key=args.h5_dataset_key)
 
@@ -689,6 +834,47 @@ def _predict(args: argparse.Namespace) -> None:
                 end = min(start + pred_bs, n)
                 xb = load_batch(idx[start:end], downsample)[..., np.newaxis]
                 proba[start:end] = np.asarray(m.predict(xb, verbose=0), dtype=np.float32)
+            base_blocks.append(proba)
+        elif name == "chloe_model":
+            if "base_chloe_model" not in manifest.paths:
+                raise ValueError("Run missing final base model 'base_chloe_model' (train with --refit-final).")
+            base_dir = run_dir / manifest.paths["base_chloe_model"]
+            model, scaler_meta, scaler_eeg = ChloeModel.load(base_dir)
+            import h5py
+
+            def prepare_features(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                X_meta_raw = batch[:, :11]
+                X_eeg_raw = batch[:, 11:1261]
+                current_freq = 1.0 / (X_meta_raw[:, 4] + 1e-6)
+                mean_past_freq = 1.0 / (X_meta_raw[:, 2] + 1e-6)
+                freq_delta = np.abs(current_freq - mean_past_freq)
+                X_meta_enriched = np.column_stack((X_meta_raw, current_freq, mean_past_freq, freq_delta)).astype(
+                    np.float32, copy=False
+                )
+                return X_eeg_raw, X_meta_enriched
+
+            pred_bs = int(manifest.config_used.get("chloe", {}).get("predict_batch_size", 2048))
+            proba = np.zeros((n, 3), dtype=np.float32)
+            for start in range(0, n, pred_bs):
+                end = min(start + pred_bs, n)
+                batch_idx = idx[start:end]
+                order = np.argsort(batch_idx)
+                idx_sorted = batch_idx[order]
+                with h5py.File(args.x_h5, "r") as f:
+                    ds = f[args.h5_dataset_key]
+                    batch = np.asarray(ds[idx_sorted, :], dtype=np.float32)
+                inv = np.empty_like(order)
+                inv[order] = np.arange(order.shape[0])
+                batch = batch[inv]
+
+                eeg_raw, meta_enriched = prepare_features(batch)
+                X_meta = scaler_meta.transform(meta_enriched).astype(np.float32, copy=False)
+                eeg_scaled = scaler_eeg.transform(eeg_raw.reshape(-1, 1)).reshape(eeg_raw.shape).astype(
+                    np.float32, copy=False
+                )
+                X_eeg = eeg_scaled.reshape((eeg_scaled.shape[0], eeg_scaled.shape[1], 1))
+                proba[start:end] = np.asarray(model.predict([X_eeg, X_meta], verbose=0), dtype=np.float32)
+
             base_blocks.append(proba)
         else:
             raise ValueError(f"Unknown base model in manifest: {name}")
@@ -809,6 +995,8 @@ def _analyze(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if bool(getattr(args, "cpu_only", False)):
+        _apply_cpu_only()
     if args.cmd == "train":
         _train(args)
     elif args.cmd == "predict":

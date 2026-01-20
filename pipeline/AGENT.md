@@ -12,7 +12,7 @@ Refactoriser `stacking/stacking.py` en une pipeline ML propre, reproductible et 
 - Meta-learner entraîné sur OOF uniquement (pas de leakage).
 - En inférence, pas d’entraînement implicite (on charge des artefacts).
 - Ordre des base models figé et sauvegardé (concat `Z` stable).
-- LSTM optionnel, activable/désactivable via CLI.
+- Base models optionnels, activables/désactivables via CLI (HGB/LSTM/CNN/Chloe).
 
 ## Arborescence
 - `pipeline/cli.py` : commandes `train|evaluate|predict` (entrypoint).
@@ -20,7 +20,7 @@ Refactoriser `stacking/stacking.py` en une pipeline ML propre, reproductible et 
 - `pipeline/stacking_oof.py` : logique OOF par indices (retourne blocs, `Z_oof`, `fold_id`).
 - `pipeline/artifacts.py` : sauvegarde/chargement (manifest + modèles).
 - `pipeline/metrics.py` : métriques (accuracy, confusion matrix, rapports).
-- `pipeline/models/` : wrappers modèles base + meta (HGB, LSTM, meta).
+- `pipeline/models/` : wrappers modèles base + meta (HGB, LSTM, CNN, Chloe, meta).
 - `pipeline/feature_engineering/` : génération des features boosting (H5 -> tabulaire).
 
 ## Conventions
@@ -33,16 +33,22 @@ Refactoriser `stacking/stacking.py` en une pipeline ML propre, reproductible et 
     - Haar DWT stats (logique `dwt_features.py`)
     - DWT `db4` + stats par fenêtres (logique `Ethan_P/feature_engineering/dwt_max.py`)
   - sortie HGB: tableau `(N, 121)` = `11 + 110` (pas de points bruts du signal)
+  - si `--hgb-fe` n’est pas activé, HGB utilise automatiquement le mode `meta-only` (11 meta features, drop du signal brut).
 
 ## Optimisation
 - `--optimize` (random search) enregistre `opt/trials.jsonl`, `opt/best_params.json`, `opt/best_score.json`, `opt/config_used.json`.
-- `--opt-targets` permet de choisir quoi optimiser (`meta`, `hgb`, `lstm`, `cnn`).
+- `--opt-targets` permet de choisir quoi optimiser (`meta`, `hgb`, `lstm`, `cnn`, `chloe`).
 - Budget optimisation (pour éviter des runs trop longs) :
   - LSTM: `--opt-budget-lstm-epochs`, `--opt-budget-lstm-max-train-samples`
   - CNN: `--opt-budget-cnn-epochs`, `--opt-budget-cnn-max-train-samples`
+  - Chloe: `--opt-budget-chloe-epochs`, `--opt-budget-chloe-max-train-samples`
 - Invariant: le meta-learner reste entraîné uniquement sur `Z_oof` (OOF), même pendant l’optimisation.
 
 ## Déséquilibre de classes
 - `--undersample-balanced` : construit un sous-ensemble équilibré (mêmes effectifs par classe) *avant* OOF. Le run sauvegarde `balance/undersample_balanced.npz` avec `kept_idx` (reproductible).
 - `--class-weights-auto` : conserve toutes les données, mais utilise des poids de classe (inverse fréquence) pendant l'entraînement (HGB via `sample_weight`, LSTM/CNN via `class_weight`).
 - Les deux options sont mutuellement exclusives.
+
+## Notes TensorFlow
+- Les modèles TF (LSTM/CNN/Chloe) lisent directement le H5 et utilisent des batches (pas de chargement complet en RAM).
+- En `predict`, on fixe `CUDA_VISIBLE_DEVICES` par défaut (si non défini) pour éviter les erreurs `cuInit` sur machines sans GPU.

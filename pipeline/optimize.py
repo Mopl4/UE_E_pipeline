@@ -17,6 +17,8 @@ class OptConfig:
     budget_lstm_max_train_samples: int = 20000
     budget_cnn_epochs: int = 2
     budget_cnn_max_train_samples: int = 20000
+    budget_chloe_epochs: int = 2
+    budget_chloe_max_train_samples: int = 20000
 
 
 def _choice(rng: np.random.Generator, vals: list[Any]) -> Any:
@@ -59,6 +61,16 @@ def sample_params(
         out["cnn.batch_size"] = int(_choice(rng, [32, 64, 128]))
         out["cnn.predict_batch_size"] = int(_choice(rng, [2048, 4096, 8192]))
 
+    if "chloe" in tset:
+        out["chloe.conv1_filters"] = int(_choice(rng, [16, 32, 48]))
+        out["chloe.conv2_filters"] = int(_choice(rng, [32, 64, 96]))
+        out["chloe.eeg_lstm_units"] = int(_choice(rng, [32, 64, 96]))
+        out["chloe.meta_dense_units"] = int(_choice(rng, [16, 32, 64]))
+        out["chloe.fusion_dense_units"] = int(_choice(rng, [16, 32, 64]))
+        out["chloe.lr"] = float(_choice(rng, [1e-3, 3e-4]))
+        out["chloe.batch_size"] = int(_choice(rng, [32, 64]))
+        out["chloe.predict_batch_size"] = int(_choice(rng, [1024, 2048, 4096]))
+
     return out
 
 
@@ -73,4 +85,3 @@ def split_namespaced(params: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ns, key = k.split(".", 1)
         out.setdefault(ns, {})[key] = v
     return out
-
