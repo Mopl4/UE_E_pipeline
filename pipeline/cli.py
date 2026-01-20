@@ -126,6 +126,12 @@ def _parse_args() -> argparse.Namespace:
     pred.add_argument("--x-h5", default=None, help="H5 (si le run attend du H5).")
     pred.add_argument("--h5-dataset-key", default="features")
     pred.add_argument("--out", required=True)
+    pred.add_argument(
+        "--out-format",
+        choices=["full", "benchmark"],
+        default="full",
+        help="Format de sortie: full (id,pred,proba_*) ou benchmark (id,label).",
+    )
 
     ev = sub.add_parser("evaluate", help="Evaluate a saved run without modifying it.")
     ev.add_argument("--run-dir", required=True)
@@ -694,11 +700,18 @@ def _predict(args: argparse.Namespace) -> None:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cols = ["id", "pred"] + [f"proba_{i}" for i in range(meta_proba.shape[1])]
-    out = np.concatenate([idx.reshape(-1, 1), pred.reshape(-1, 1), meta_proba], axis=1)
-    import pandas as pd
+    if args.out_format == "benchmark":
+        y_pred = pred.astype(np.int64, copy=False)
+        with out_path.open("w", encoding="utf-8") as f:
+            f.write("id,label\n")
+            for i, y in enumerate(y_pred):
+                f.write(f"{i},{int(y)}\n")
+    else:
+        cols = ["id", "pred"] + [f"proba_{i}" for i in range(meta_proba.shape[1])]
+        out = np.concatenate([idx.reshape(-1, 1), pred.reshape(-1, 1), meta_proba], axis=1)
+        import pandas as pd
 
-    pd.DataFrame(out, columns=cols).to_csv(out_path, index=False)
+        pd.DataFrame(out, columns=cols).to_csv(out_path, index=False)
     print(f"[PRED] wrote {out_path}")
 
 
